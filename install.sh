@@ -19,24 +19,64 @@ log()  { printf '%s\n' "$*"; }
 err()  { printf 'error: %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
-# fetch URL -> stdout. --proto '=https' refuses a plaintext redirect; -f makes HTTP errors fail
-# rather than writing an HTML error page into a file we would then trust.
-fetch() {
-  if command -v curl >/dev/null 2>&1; then
-    curl --proto '=https' --tlsv1.2 -fsSL "$1"
-  elif command -v wget >/dev/null 2>&1; then
-    wget --https-only -qO- "$1"
-  else
-    die "neither curl nor wget is available"
+# require_downloader fails EARLY and specifically when HTTPS cannot be enforced, rather than
+# letting every request fail later and be misreported as a network problem. busybox wget rejects
+# --https-only outright, which is a real and common case (alpine, many container images).
+require_downloader() {
+  command -v curl >/dev/null 2>&1 && return 0
+  if command -v wget >/dev/null 2>&1; then
+    if wget --help 2>&1 | grep -q -- "--https-only"; then
+      return 0
+    fi
+    die "this wget does not support --https-only (busybox?), so HTTPS cannot be enforced for the download. Install curl and re-run."
   fi
+  die "neither curl nor wget is available"
 }
 
-fetch_to() {
+# http_get URL DEST -> writes the body to DEST, prints a status TOKEN on stdout:
+#
+#   <numeric>  the HTTP status (curl only)
+#   ERR        the server returned an error response, but this downloader cannot say which
+#              (GNU wget exits 8 for any HTTP error without reporting the code)
+#   000        transport failure — DNS, connection refused, TLS, timeout
+#
+# The token is the point: collapsing everything into "download failed" is what made a fresh
+# install print a raw `curl: (56) ... 404` and then a vague message, when the real situation — no
+# releases published yet — is specific and worth saying plainly.
+#
+# curl prints `000` on stdout ITSELF when the transfer fails, so a naive `|| printf '000'` appends
+# a second one and yields "000000", which matches no case and reports "unexpected response (HTTP
+# 000000)". Capture first, then override on a non-zero exit; that also maps a mid-body failure
+# after a 200 to 000, which is the fail-closed direction.
+http_get() {
+  _err="${tmp:-${TMPDIR:-/tmp}}/http.err"
   if command -v curl >/dev/null 2>&1; then
-    curl --proto '=https' --tlsv1.2 -fsSL -o "$2" "$1"
-  else
-    wget --https-only -qO "$2" "$1"
+    _code="$(curl --proto '=https' --tlsv1.2 -sSL -o "$2" -w '%{http_code}' "$1" 2>"$_err")" || _code=000
+    printf '%s' "${_code:-000}"
+    return 0
   fi
+  # Capture the exit code explicitly. Under `set -e` an unprotected non-zero wget exits the whole
+  # script before the case is ever reached — so on a wget machine an HTTP error killed the
+  # installer silently, with no message at all. The curl arm is protected by its `||`; this arm
+  # was not, and no test executed it.
+  _rc=0
+  wget --https-only -qO "$2" "$1" 2>"$_err" || _rc=$?
+  case "$_rc" in
+    0) printf '200' ;;
+    # GNU wget: 8 = "server issued an error response". It does NOT say which, so claiming the
+    # network is unreachable here would be a false diagnosis of the most common case.
+    8) printf 'ERR' ;;
+    *) printf '000' ;;
+  esac
+}
+
+# transport_detail returns the downloader's own last error line, if any. A TLS failure (corporate
+# MITM) is otherwise indistinguishable from being offline, and it is the one diagnostic worth not
+# swallowing on a `curl | sh` installer.
+transport_detail() {
+  _err="${tmp:-${TMPDIR:-/tmp}}/http.err"
+  [ -s "$_err" ] || return 0
+  printf '\n  %s' "$(tail -n 1 "$_err")"
 }
 
 detect_platform() {
@@ -112,13 +152,39 @@ main() {
   os="${platform% *}"
   arch="${platform#* }"
 
+  tmp="$(mktemp -d)"
+  # INT/TERM listed explicitly: not every shell runs an EXIT trap on an untrapped signal (dash),
+  # which would leak the temp dir.
+  trap 'rm -rf "$tmp" "${stage:-}"' EXIT INT TERM
+
   version="${FASTASSERT_VERSION:-}"
   if [ -z "$version" ]; then
     log "resolving latest release..."
     # /releases/latest excludes drafts and prereleases, so a rehearsal tag is never installed.
-    version="$(fetch "https://api.github.com/repos/${REPO}/releases/latest" \
-      | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
-    [ -n "$version" ] || die "could not resolve the latest release of ${REPO}. Set FASTASSERT_VERSION to install a specific tag."
+    code="$(http_get "https://api.github.com/repos/${REPO}/releases/latest" "${tmp}/latest.json")"
+    case "$code" in
+      200) ;;
+      404)
+        die "no releases have been published for ${REPO} yet, so there is nothing to install.
+  If you are expecting a specific version, set FASTASSERT_VERSION=vX.Y.Z.
+  Otherwise check https://github.com/${REPO}/releases for the current state."
+        ;;
+      403|429)
+        die "GitHub rate-limited this request (HTTP ${code}). Wait a few minutes, or set FASTASSERT_VERSION=vX.Y.Z to skip the lookup."
+        ;;
+      ERR)
+        die "api.github.com returned an error response while resolving the latest release.
+  If you are expecting a specific version, set FASTASSERT_VERSION=vX.Y.Z."
+        ;;
+      000)
+        die "could not reach api.github.com — check network access, a proxy, or DNS.$(transport_detail)"
+        ;;
+      *)
+        die "unexpected response from api.github.com (HTTP ${code}) while resolving the latest release."
+        ;;
+    esac
+    version="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${tmp}/latest.json" | head -n 1)"
+    [ -n "$version" ] || die "api.github.com returned a release with no tag_name. Set FASTASSERT_VERSION=vX.Y.Z to install a specific tag."
   fi
 
   archive="fastassert_${version}_${os}_${arch}.tar.gz"
@@ -126,16 +192,18 @@ main() {
 
   require_sha_tool
 
-  tmp="$(mktemp -d)"
-  # INT/TERM listed explicitly: not every shell runs an EXIT trap on an untrapped signal (dash),
-  # which would leak the temp dir.
-  trap 'rm -rf "$tmp" "${stage:-}"' EXIT INT TERM
-
   log "downloading ${archive}"
-  fetch_to "${base}/${archive}" "${tmp}/${archive}" \
-    || die "download failed: ${base}/${archive} (is ${version} published for ${os}/${arch}?)"
-  fetch_to "${base}/SHA256SUMS" "${tmp}/SHA256SUMS" \
-    || die "could not download SHA256SUMS for ${version}"
+  code="$(http_get "${base}/${archive}" "${tmp}/${archive}")"
+  case "$code" in
+    200) ;;
+    404) die "${version} has no build for ${os}/${arch}.
+  Published assets for that tag: https://github.com/${REPO}/releases/tag/${version}" ;;
+    ERR) die "github.com returned an error response for ${archive}. Published assets for ${version}: https://github.com/${REPO}/releases/tag/${version}" ;;
+    000) die "could not reach github.com to download ${archive} — check network access, a proxy, or DNS.$(transport_detail)" ;;
+    *)   die "downloading ${archive} failed (HTTP ${code})." ;;
+  esac
+  code="$(http_get "${base}/SHA256SUMS" "${tmp}/SHA256SUMS")"
+  [ "$code" = "200" ] || die "could not download SHA256SUMS for ${version} (HTTP ${code}). Refusing to install an unverified binary."
 
   log "verifying checksum"
   ( cd "$tmp" && verify_checksum "$archive" SHA256SUMS ) \
