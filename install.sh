@@ -254,10 +254,13 @@ main() {
   # believes they upgraded while the old process keeps running until the next reload.
   log ""
   log "If a runner daemon is already registered, restart it to pick this up:"
-  log "    fastassert runner install"
+  log "    fastassert runner install     # macOS: this reloads the LaunchAgent"
+  log "    systemctl --user restart fastassert-runner   # Linux: 'install' does NOT restart it"
   log ""
   log "Next: write config.toml with your api_url and runner_key, then run 'fastassert runner install'."
-  log "Daemon registration is macOS-only for now; on Linux the CLI works and 'fastassert runner run' runs in the foreground."
+  log "Daemon registration writes a launchd LaunchAgent on macOS and a systemd user unit on Linux."
+  log "The Linux path is released but not yet verified on a real host — if you hit trouble, run"
+  log "'fastassert runner run' in the foreground under your own supervisor and please report it."
 }
 
 main "$@"
